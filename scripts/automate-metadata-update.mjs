@@ -183,7 +183,7 @@ async function updateExistingRecords() {
         const updateQuery = `
           UPDATE video_mappings
           SET ${updates.join(', ')}
-          WHERE id = $${paramIndex - 1}
+          WHERE id = $${paramIndex}
         `;
 
         await client.query(updateQuery, values);
@@ -204,7 +204,7 @@ async function updateExistingRecords() {
       await new Promise(resolve => setTimeout(resolve, 1000));
 
     } catch (err) {
-      logStatus(`[UPDATE] Error updating record ${row.id}:`, err.message);
+      logStatus(`[UPDATE] Error updating record ${row.id}: ${err.message}`);
       errorCount++;
     }
   }
