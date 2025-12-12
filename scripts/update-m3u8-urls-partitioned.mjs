@@ -8,6 +8,12 @@ import KeepAliveService from './keep-alive.mjs';
 const connectionString = 'postgresql://neondb_owner:npg_rjmolz6Ecn9T@ep-autumn-hall-aho0evwl-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
 const PART = parseInt(process.env.PART || '1', 10); // 1, 2, or 3
 const TOTAL_PARTS = parseInt(process.env.TOTAL_PARTS || '3', 10); // e.g., 3
+// If set to 'true' (or '1'), one instance will process the whole DB (ignoring partitioning)
+const PROCESS_ALL = (process.env.PROCESS_ALL === 'true' || process.env.PROCESS_ALL === '1');
+// If set to 'true' (or '1'), process ALL records (not just stale ones) — useful for initial full update
+const PROCESS_ALL_RECORDS = (process.env.PROCESS_ALL_RECORDS === 'true' || process.env.PROCESS_ALL_RECORDS === '1');
+// Number of records to process per cycle (to allow batching over large DBs)
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '1000', 10);
 const UPDATE_INTERVAL_MS = 60000;
 const PORT = process.env.PORT || 3000;
 const KEEP_ALIVE_INTERVAL_MS = parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || '30000', 10);
@@ -15,6 +21,7 @@ const MAIN_SERVER_URLS = (process.env.MAIN_SERVER_URLS || 'http://localhost:3000
 let updaterStarted = false;
 let updaterError = null;
 let lastUpdateCycle = null;
+let lastProcessedId = 0; // Track last processed ID for PROCESS_ALL_RECORDS to avoid oscillation
 const logBuffer = [];
 const MAX_LOGS = 100;
 
@@ -70,37 +77,61 @@ async function updateM3u8UrlsPartitioned() {
     }
     while (true) {
       try {
-        // Partition logic: get all IDs, split into parts
+        // Partition logic: get all IDs, split into parts (or process all if PROCESS_ALL)
         const { rows: allRows } = await client.query('SELECT id FROM video_mappings ORDER BY id');
         if (allRows.length === 0) {
           logStatus('No mappings found. Sleeping...');
           await sleep(UPDATE_INTERVAL_MS);
           continue;
         }
-        const partSize = Math.ceil(allRows.length / TOTAL_PARTS);
-        const start = (PART - 1) * partSize;
-        const end = Math.min(PART * partSize, allRows.length);
-        const partitionRows = allRows.slice(start, end);
-        logStatus('All records in this partition:');
-        for (const r of partitionRows) {
-          logStatus(`  id: ${r.id}`);
+        let partitionRows;
+        if (PROCESS_ALL) {
+          partitionRows = allRows;
+          logStatus(`PROCESS_ALL enabled — processing all ${allRows.length} records in batches of ${BATCH_SIZE}`);
+        } else {
+          const partSize = Math.ceil(allRows.length / TOTAL_PARTS);
+          const start = (PART - 1) * partSize;
+          const end = Math.min(PART * partSize, allRows.length);
+          partitionRows = allRows.slice(start, end);
+          logStatus('All records in this partition:');
+          for (const r of partitionRows) {
+            logStatus(`  id: ${r.id}`);
+          }
+        }
+        if (PROCESS_ALL_RECORDS) {
+          logStatus(`PROCESS_ALL_RECORDS enabled — starting from id > ${lastProcessedId}`);
         }
         const ids = partitionRows.map(r => r.id);
         if (ids.length === 0) {
           await sleep(UPDATE_INTERVAL_MS);
           continue;
         }
-        // Get all records in this partition needing update, ordered by last_updated (NULLS FIRST)
-        let { rows } = await client.query(
-          `SELECT * FROM video_mappings WHERE id = ANY($1) AND (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') ORDER BY last_updated NULLS FIRST`,
-          [ids]
-        );
+        // Get records in this partition needing update, ordered by last_updated (NULLS FIRST), limited by batch size
+        let query = `SELECT * FROM video_mappings WHERE id = ANY($1)`;
+        let params = [ids];
+        if (!PROCESS_ALL_RECORDS) {
+          query += ` AND (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') ORDER BY last_updated NULLS FIRST`;
+        } else {
+          query += ` AND id > $2 ORDER BY id`;
+          params.push(lastProcessedId);
+        }
+        query += ` LIMIT $` + (params.length + 1);
+        params.push(BATCH_SIZE);
+        let { rows } = await client.query(query, params);
         // If no records in this partition, take over from other partitions
         if (rows.length === 0) {
           logStatus('No mappings in partition need update. Taking over other partitions...');
-          const { rows: allUpdateRows } = await client.query(
-            `SELECT * FROM video_mappings WHERE (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') ORDER BY last_updated NULLS FIRST LIMIT 10`
-          );
+          let takeoverQuery = `SELECT * FROM video_mappings`;
+          let takeoverParams = [];
+          if (!PROCESS_ALL_RECORDS) {
+            takeoverQuery += ` WHERE (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') ORDER BY last_updated NULLS FIRST`;
+          } else {
+            takeoverQuery += ` WHERE id > $1 ORDER BY id`;
+            takeoverParams.push(lastProcessedId);
+          }
+          takeoverQuery += ` LIMIT $` + (takeoverParams.length + 1);
+          takeoverParams.push(BATCH_SIZE);
+          const { rows: allUpdateRows } = await client.query(takeoverQuery, takeoverParams);
           rows = allUpdateRows;
           if (rows.length === 0) {
             logStatus('No mappings in any partition need update. Sleeping...');
@@ -108,6 +139,7 @@ async function updateM3u8UrlsPartitioned() {
             continue;
           }
         }
+        logStatus(`Processing ${rows.length} rows this cycle (batch size ${BATCH_SIZE})`);
         logStatus('Records filtered for update (null/oldest):');
         rows.forEach(r => {
           logStatus(`  id: ${r.id}, name: ${r.name}, last_updated: ${r.last_updated}`);
@@ -162,6 +194,10 @@ async function updateM3u8UrlsPartitioned() {
           }
         }
         lastUpdateCycle = new Date();
+        if (PROCESS_ALL_RECORDS && rows.length > 0) {
+          lastProcessedId = Math.max(...rows.map(r => r.id));
+          logStatus(`Updated lastProcessedId to ${lastProcessedId}`);
+        }
         logStatus(`Cycle completed. Sleeping for ${UPDATE_INTERVAL_MS / 1000} seconds...`);
         await sleep(UPDATE_INTERVAL_MS);
       } catch (cycleErr) {
@@ -196,7 +232,7 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   logStatus(`Status server listening on port ${PORT}`);
   keepAlive.start();
-  logStatus(`🔄 Keep-alive pings started (every ${KEEP_ALIVE_INTERVAL_MS/1000}s to ${MAIN_SERVER_URLS.length} servers)`);
+  logStatus(`🔄 Keep-alive pings started (every ${KEEP_ALIVE_INTERVAL_MS / 1000}s to ${MAIN_SERVER_URLS.length} servers)`);
 });
 
 process.on('SIGINT', () => {
