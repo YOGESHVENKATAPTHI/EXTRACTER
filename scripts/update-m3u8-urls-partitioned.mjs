@@ -1,3 +1,5 @@
+
+
 import { Client } from 'pg';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
@@ -11,6 +13,7 @@ const TOTAL_PARTS = parseInt(process.env.TOTAL_PARTS || '3', 10); // e.g., 3
 const UPDATE_INTERVAL_MS = 60000;
 const PORT = process.env.PORT || 3000;
 const KEEP_ALIVE_INTERVAL_MS = parseInt(process.env.KEEP_ALIVE_INTERVAL_MS || '30000', 10);
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '10', 10);
 const MAIN_SERVER_URLS = (process.env.MAIN_SERVER_URLS || 'http://localhost:3000').split(',').map(url => url.trim()); // Main server URLs for keep-alive pings, comma-separated
 let updaterStarted = false;
 let updaterError = null;
@@ -69,105 +72,102 @@ async function updateM3u8UrlsPartitioned() {
       await client.query(`ALTER TABLE video_mappings ADD COLUMN IF NOT EXISTS ${col.name} ${col.type};`);
     }
     while (true) {
-      try {
-        // Partition logic: get all IDs, split into parts
-        const { rows: allRows } = await client.query('SELECT id FROM video_mappings ORDER BY id');
-        if (allRows.length === 0) {
-          logStatus('No mappings found. Sleeping...');
-          await sleep(UPDATE_INTERVAL_MS);
-          continue;
-        }
-        const partSize = Math.ceil(allRows.length / TOTAL_PARTS);
-        const start = (PART - 1) * partSize;
-        const end = Math.min(PART * partSize, allRows.length);
-        const partitionRows = allRows.slice(start, end);
-        logStatus('All records in this partition:');
-        for (const r of partitionRows) {
-          logStatus(`  id: ${r.id}`);
-        }
-        const ids = partitionRows.map(r => r.id);
-        if (ids.length === 0) {
-          await sleep(UPDATE_INTERVAL_MS);
-          continue;
-        }
-        // Get all records in this partition needing update, ordered by last_updated (NULLS FIRST)
-        let { rows } = await client.query(
-          `SELECT * FROM video_mappings WHERE id = ANY($1) AND (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') ORDER BY last_updated NULLS FIRST`,
-          [ids]
-        );
-        // If no records in this partition, take over from other partitions
-        if (rows.length === 0) {
-          logStatus('No mappings in partition need update. Taking over other partitions...');
-          const { rows: allUpdateRows } = await client.query(
-            `SELECT * FROM video_mappings WHERE (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') ORDER BY last_updated NULLS FIRST LIMIT 10`
-          );
-          rows = allUpdateRows;
-          if (rows.length === 0) {
-            logStatus('No mappings in any partition need update. Sleeping...');
-            await sleep(UPDATE_INTERVAL_MS);
-            continue;
-          }
-        }
-        logStatus('Records filtered for update (null/oldest):');
-        rows.forEach(r => {
-          logStatus(`  id: ${r.id}, name: ${r.name}, last_updated: ${r.last_updated}`);
-        });
-        for (const entry of rows) {
-          if (!entry || !entry.video) continue;
-          let mp4Url = null;
-          let m3u8Url = null;
-          let finalUrl = null;
-          try {
-            // Fetch the video page and parse ld+json
-            const proxyUrl = 'https://webproxier-ov6et6gpw-ogeshs-projects.vercel.app/api/proxy?url=';
-            const videoPageRes = await fetch(proxyUrl + encodeURIComponent(entry.video), {
-              headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-              }
-            });
-            const videoHtml = await videoPageRes.text();
-            const $video = cheerio.load(videoHtml);
-            const ldJson = $video('script[type="application/ld+json"]').html();
-            if (ldJson) {
-              const meta = JSON.parse(ldJson);
-              if (meta.contentUrl) {
-                if (meta.contentUrl.endsWith('.m3u8')) {
-                  m3u8Url = meta.contentUrl;
-                } else {
-                  mp4Url = meta.contentUrl;
-                }
-              }
-            }
-            if (mp4Url) {
-              finalUrl = mp4Url;
-            } else if (m3u8Url) {
-              finalUrl = m3u8Url;
-            }
-          } catch (err) {
-            logStatus(`[ERROR] Failed to extract video meta for video: ${entry.video} - ${err}`);
-          }
-          if (finalUrl && entry.url !== finalUrl) {
-            logStatus(`Updated url for: ${entry.name}`);
-            await client.query(
-              `UPDATE video_mappings SET url = $1, last_updated = NOW() WHERE id = $2`,
-              [finalUrl, entry.id]
-            );
-            logStatus('NeonDB updated with new url.');
-          } else {
-            await client.query(
-              `UPDATE video_mappings SET last_updated = NOW() WHERE id = $1`,
-              [entry.id]
-            );
-            logStatus(`No url update for: ${entry.name}`);
-          }
-        }
-        lastUpdateCycle = new Date();
-        logStatus(`Cycle completed. Sleeping for ${UPDATE_INTERVAL_MS / 1000} seconds...`);
+      // Partition logic: get all IDs, split into parts
+      const { rows: allRows } = await client.query('SELECT id FROM video_mappings ORDER BY id');
+      if (allRows.length === 0) {
+        logStatus('No mappings found. Sleeping...');
         await sleep(UPDATE_INTERVAL_MS);
-      } catch (cycleErr) {
-        logStatus(`Error in update cycle: ${cycleErr.message}. Continuing...`);
-        await sleep(UPDATE_INTERVAL_MS);
+        continue;
       }
+      const partSize = Math.ceil(allRows.length / TOTAL_PARTS);
+      const start = (PART - 1) * partSize;
+      const end = Math.min(PART * partSize, allRows.length);
+      const partitionRows = allRows.slice(start, end);
+      logStatus('All records in this partition:');
+      for (const r of partitionRows) {
+        logStatus(`  id: ${r.id}`);
+      }
+      const ids = partitionRows.map(r => r.id);
+      if (ids.length === 0) {
+        await sleep(UPDATE_INTERVAL_MS);
+        continue;
+      }
+      // Get up to BATCH_SIZE records in this partition needing update, ordered by last_updated (NULLS FIRST)
+      let { rows } = await client.query(
+        `SELECT * FROM video_mappings WHERE id = ANY($1) AND (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') ORDER BY last_updated NULLS FIRST LIMIT $2`,
+        [ids, BATCH_SIZE]
+      );
+      // If there are fewer than BATCH_SIZE records in this partition, top-up from other partitions
+      if (rows.length < BATCH_SIZE) {
+        const remaining = BATCH_SIZE - rows.length;
+        logStatus(`Partition returned ${rows.length}/${BATCH_SIZE} rows. Topping up ${remaining} rows from other partitions...`);
+        const { rows: extraRows } = await client.query(
+          `SELECT * FROM video_mappings WHERE (last_updated IS NULL OR last_updated < NOW() - INTERVAL '2 hours') AND NOT (id = ANY($1)) ORDER BY last_updated NULLS FIRST LIMIT $2`,
+          [ids, remaining]
+        );
+        if (extraRows && extraRows.length > 0) rows = rows.concat(extraRows);
+      }
+      // If still none, try to take over other partitions entirely (no partition restriction)
+      if (rows.length === 0) {
+        logStatus('No mappings in any partition need update. Sleeping...');
+        await sleep(UPDATE_INTERVAL_MS);
+        continue;
+      }
+      logStatus('Records filtered for update (null/oldest):');
+      rows.forEach(r => {
+        logStatus(`  id: ${r.id}, name: ${r.name}, last_updated: ${r.last_updated}`);
+      });
+      for (const entry of rows) {
+        if (!entry || !entry.video) continue;
+        let mp4Url = null;
+        let m3u8Url = null;
+        let finalUrl = null;
+        try {
+          // Fetch the video page and parse ld+json
+          const proxyUrl = 'https://webproxier-ov6et6gpw-ogeshs-projects.vercel.app/api/proxy?url=';
+          const videoPageRes = await fetch(proxyUrl + encodeURIComponent(entry.video), {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+          });
+          const videoHtml = await videoPageRes.text();
+          const $video = cheerio.load(videoHtml);
+          const ldJson = $video('script[type="application/ld+json"]').html();
+          if (ldJson) {
+            const meta = JSON.parse(ldJson);
+            if (meta.contentUrl) {
+              if (meta.contentUrl.endsWith('.m3u8')) {
+                m3u8Url = meta.contentUrl;
+              } else {
+                mp4Url = meta.contentUrl;
+              }
+            }
+          }
+          if (mp4Url) {
+            finalUrl = mp4Url;
+          } else if (m3u8Url) {
+            finalUrl = m3u8Url;
+          }
+        } catch (err) {
+          logStatus(`[ERROR] Failed to extract video meta for video: ${entry.video} - ${err}`);
+        }
+        if (finalUrl && entry.url !== finalUrl) {
+          logStatus(`Updated url for: ${entry.name}`);
+          await client.query(
+            `UPDATE video_mappings SET url = $1, last_updated = NOW() WHERE id = $2`,
+            [finalUrl, entry.id]
+          );
+          logStatus('NeonDB updated with new url.');
+        } else {
+          await client.query(
+            `UPDATE video_mappings SET last_updated = NOW() WHERE id = $1`,
+            [entry.id]
+          );
+          logStatus(`No url update for: ${entry.name}`);
+        }
+      }
+      lastUpdateCycle = new Date();
+      await sleep(UPDATE_INTERVAL_MS);
     }
   } catch (err) {
     updaterError = err;
