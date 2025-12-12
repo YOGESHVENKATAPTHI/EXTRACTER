@@ -27,7 +27,11 @@
     "render:config:staging": "node scripts/generate-render-config.mjs staging",
     "worker:config": "node scripts/worker-url-helper.mjs",
     "worker:test": "node scripts/worker-url-helper.mjs test",
-    "extract-urls": "node scripts/extract-urls.mjs"
+    "extract-urls": "node scripts/extract-urls.mjs",
+    "start:m3u8:top-down": "cross-env PROCESS_ALL=1 PROCESS_ALL_RECORDS=1 BATCH_SIZE=1000 node scripts/update-m3u8-top-down.mjs",
+    "start:m3u8:bottom-up": "cross-env PROCESS_ALL=1 PROCESS_ALL_RECORDS=1 BATCH_SIZE=1000 node scripts/update-m3u8-bottom-up.mjs",
+    "start:m3u8:middle-to-bottom": "cross-env PROCESS_ALL=1 PROCESS_ALL_RECORDS=1 BATCH_SIZE=1000 node scripts/update-m3u8-middle-to-bottom.mjs",
+    "start:m3u8:middle-to-top": "cross-env PROCESS_ALL=1 PROCESS_ALL_RECORDS=1 BATCH_SIZE=1000 node scripts/update-m3u8-middle-to-top.mjs"
   },
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
